@@ -4,31 +4,30 @@ import pandas as pd
 import re
 import io
 
-st.set_page_config(page_title="ANZ Precision Converter", layout="wide")
-st.title("🏦 ANZ Bank Statement to Excel")
+st.set_page_config(page_title="ANZ Business Converter", layout="wide")
+st.title("🏦 ANZ Precision Statement Converter")
 
-def clean_money(val):
+def clean_money(text_list):
+    """Filters out Reference IDs and cleans currency strings."""
+    val = " ".join(text_list).strip()
     if not val: return 0.0
-    # Removes everything except digits and dots
-    s = re.sub(r'[^\d.]', '', str(val).replace(',', ''))
+    # Remove commas and non-numeric junk
+    clean = re.sub(r'[^\d.]', '', val.replace(',', ''))
     try:
-        # ANZ Ref IDs are long integers (e.g., 860211). 
-        # Money almost always has a decimal or is smaller.
-        if s.isdigit() and len(s) >= 5: return 0.0
-        return float(s) if s else 0.0
+        # ANZ Ref IDs are typically 6 digits with no decimals.
+        # This check ignores them so they don't end up in your totals.
+        if clean.isdigit() and len(clean) >= 6: return 0.0
+        return float(clean) if clean else 0.0
     except: return 0.0
 
 uploaded_file = st.file_uploader("Upload ANZ PDF", type="pdf")
 
 if uploaded_file:
-    all_rows = []
-    
+    all_data = []
     with pdfplumber.open(io.BytesIO(uploaded_file.getvalue())) as pdf:
         for page in pdf.pages:
-            # We extract every word with its exact X/Y position
             words = page.extract_words()
-            
-            # Group words into lines based on their vertical 'top' position
+            # Group words by their vertical position (Y coordinate)
             lines = {}
             for w in words:
                 y = round(w['top'], 0)
@@ -36,59 +35,46 @@ if uploaded_file:
                 lines[y].append(w)
             
             for y in sorted(lines.keys()):
-                # Sort words in each line from left to right
                 line_words = sorted(lines[y], key=lambda x: x['x0'])
-                line_text = " ".join([w['text'] for w in line_words])
+                full_text = " ".join([w['text'] for w in line_words])
                 
-                # Check for the ANZ Date Pattern (e.g., 01 JUL)
-                date_match = re.search(r'^(\d{1,2}\s+[A-Z]{3})', line_text)
+                # Match ANZ date format: e.g., '01 JUL'
+                date_match = re.search(r'^(\d{1,2}\s+[A-Z]{3})', full_text)
                 
                 if date_match:
-                    date_val = date_match.group(1)
+                    # COORDINATE GATES (Calibrated for ANZ Business Layout)
+                    # Date: x < 70
+                    # Details: 70 <= x < 340
+                    # Withdrawals: 340 <= x < 430
+                    # Deposits: 430 <= x < 510
+                    # Balance: x >= 510
                     
-                    # --- ANZ SPATIAL BOUNDARIES (Manual Gates) ---
-                    # Description: Text between x=65 and x=350
-                    # Withdrawals: Text between x=350 and x=435
-                    # Deposits:    Text between x=435 and x=515
-                    # Balance:     Text between x=515 and end
-                    
-                    desc = " ".join([w['text'] for w in line_words if 65 <= w['x0'] < 350])
-                    withdraw = " ".join([w['text'] for w in line_words if 350 <= w['x0'] < 435])
-                    deposit = " ".join([w['text'] for w in line_words if 435 <= w['x0'] < 515])
-                    balance = " ".join([w['text'] for w in line_words if 515 <= w['x0']])
-                    
-                    if "OPENING BALANCE" in desc.upper(): continue
-                    
-                    all_rows.append({
-                        "Date": date_val,
-                        "Description": desc.strip(),
-                        "Withdrawals": clean_money(withdraw),
-                        "Deposits": clean_money(deposit),
-                        "Balance": clean_money(balance)
-                    })
+                    row = {
+                        "Date": date_match.group(1),
+                        "Description": " ".join([w['text'] for w in line_words if 70 <= w['x0'] < 340]),
+                        "Withdrawals": clean_money([w['text'] for w in line_words if 340 <= w['x0'] < 430]),
+                        "Deposits": clean_money([w['text'] for w in line_words if 430 <= w['x0'] < 510]),
+                        "Balance": clean_money([w['text'] for w in line_words if 510 <= w['x0']])
+                    }
+                    if "OPENING BALANCE" not in row["Description"].upper():
+                        all_data.append(row)
                 
-                elif all_rows and len(line_text) > 5:
-                    # Capture multi-line description continuation
-                    # (Text in the same horizontal 'Description' gate but no new date)
-                    extra_desc = " ".join([w['text'] for w in line_words if 65 <= w['x0'] < 350])
-                    if extra_desc and not any(k in extra_desc for k in ["Page", "Total", "Balance"]):
-                        all_rows[-1]["Description"] += " " + extra_desc.strip()
+                elif all_data and len(full_text) > 3:
+                    # Catch multi-line descriptions (e.g., 'FROM QUADSOL 3561')
+                    extra_desc = " ".join([w['text'] for w in line_words if 70 <= w['x0'] < 340])
+                    # Ensure we aren't accidentally catching footer text or page numbers
+                    if extra_desc and not any(x in extra_desc for x in ["Page", "Total", "Balance"]):
+                        all_data[-1]["Description"] += " " + extra_desc.strip()
 
-    if all_rows:
-        df = pd.DataFrame(all_rows)
-        st.success(f"Processed {len(df)} transactions.")
-        st.dataframe(df) # Preview in browser
+    if all_data:
+        df = pd.DataFrame(all_data)
+        st.success(f"Successfully cleaned {len(df)} transactions.")
+        st.dataframe(df, use_container_width=True) # Live preview
         
-        # Excel Export
+        # Download Link
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df.to_excel(writer, index=False)
-        
-        st.download_button(
-            label="📥 Download Corrected Excel",
-            data=output.getvalue(),
-            file_name="ANZ_Fixed_Statement.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        st.download_button("📥 Download Excel", output.getvalue(), "ANZ_Clean_Data.xlsx")
     else:
-        st.error("No transactions found. Make sure the PDF is text-selectable.")
+        st.error("Could not find data. Ensure this is a digital ANZ PDF.")
