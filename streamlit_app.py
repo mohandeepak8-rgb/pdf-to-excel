@@ -27,7 +27,6 @@ if uploaded_file:
     with pdfplumber.open(io.BytesIO(uploaded_file.getvalue())) as pdf:
         for page in pdf.pages:
             words = page.extract_words()
-            # Group words by their vertical position (Y coordinate)
             lines = {}
             for w in words:
                 y = round(w['top'], 0)
@@ -42,39 +41,39 @@ if uploaded_file:
                 date_match = re.search(r'^(\d{1,2}\s+[A-Z]{3})', full_text)
                 
                 if date_match:
-                    # COORDINATE GATES (Calibrated for ANZ Business Layout)
-                    # Date: x < 70
-                    # Details: 70 <= x < 340
-                    # Withdrawals: 340 <= x < 430
-                    # Deposits: 430 <= x < 510
-                    # Balance: x >= 510
+                    # COORDINATE GATES
+                    desc_text = " ".join([w['text'] for w in line_words if 70 <= w['x0'] < 340])
+                    
+                    # --- HEADER FILTER ---
+                    # Ignore rows that contain header labels instead of real data
+                    header_keywords = ["TRANSACTION DETAILS", "WITHDRAWALS", "DEPOSITS", "BALANCE", "OPENING BALANCE"]
+                    if any(key in desc_text.upper() for key in header_keywords):
+                        continue
                     
                     row = {
                         "Date": date_match.group(1),
-                        "Description": " ".join([w['text'] for w in line_words if 70 <= w['x0'] < 340]),
+                        "Description": desc_text.strip(),
                         "Withdrawals": clean_money([w['text'] for w in line_words if 340 <= w['x0'] < 430]),
                         "Deposits": clean_money([w['text'] for w in line_words if 430 <= w['x0'] < 510]),
                         "Balance": clean_money([w['text'] for w in line_words if 510 <= w['x0']])
                     }
-                    if "OPENING BALANCE" not in row["Description"].upper():
-                        all_data.append(row)
+                    all_data.append(row)
                 
                 elif all_data and len(full_text) > 3:
-                    # Catch multi-line descriptions (e.g., 'FROM QUADSOL 3561')
                     extra_desc = " ".join([w['text'] for w in line_words if 70 <= w['x0'] < 340])
-                    # Ensure we aren't accidentally catching footer text or page numbers
-                    if extra_desc and not any(x in extra_desc for x in ["Page", "Total", "Balance"]):
+                    # Ensure we aren't catching footer/header noise in descriptions
+                    noise_keywords = ["Page", "Total", "Balance", "Continued", "Details"]
+                    if extra_desc and not any(k in extra_desc for k in noise_keywords):
                         all_data[-1]["Description"] += " " + extra_desc.strip()
 
     if all_data:
         df = pd.DataFrame(all_data)
-        st.success(f"Successfully cleaned {len(df)} transactions.")
-        st.dataframe(df, use_container_width=True) # Live preview
+        st.success(f"Successfully cleaned {len(df)} transactions (Headers removed).")
+        st.dataframe(df, use_container_width=True)
         
-        # Download Link
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df.to_excel(writer, index=False)
-        st.download_button("📥 Download Excel", output.getvalue(), "ANZ_Clean_Data.xlsx")
+        st.download_button("📥 Download Clean Excel", output.getvalue(), "ANZ_Clean_Statement.xlsx")
     else:
-        st.error("Could not find data. Ensure this is a digital ANZ PDF.")
+        st.error("No valid transactions found.")
