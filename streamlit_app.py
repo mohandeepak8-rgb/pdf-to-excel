@@ -6,31 +6,29 @@ import io
 
 st.set_page_config(page_title="ANZ Precision Converter", layout="wide")
 st.title("🏦 ANZ Bank Statement to Excel")
-st.write("Fixed version: Uses spatial detection to separate Withdrawals from Descriptions.")
 
-def clean_numeric(val):
-    if val is None: return 0.0
-    # Removes commas and symbols, handles parentheses as negative
-    s = str(val).replace(',', '').replace('$', '').strip()
-    if "(" in s: s = "-" + s.replace("(", "").replace(")", "")
+def clean_money(val):
+    if not val: return 0.0
+    # Removes everything except digits and dots
+    s = re.sub(r'[^\d.]', '', str(val).replace(',', ''))
     try:
-        # ANZ Reference IDs are usually 6+ digits. Real amounts usually have decimals.
-        if s.isdigit() and len(s) >= 6: return 0.0
-        return float(s)
+        # ANZ Ref IDs are long integers (e.g., 860211). 
+        # Money almost always has a decimal or is smaller.
+        if s.isdigit() and len(s) >= 5: return 0.0
+        return float(s) if s else 0.0
     except: return 0.0
 
 uploaded_file = st.file_uploader("Upload ANZ PDF", type="pdf")
 
 if uploaded_file:
-    all_transactions = []
+    all_rows = []
     
     with pdfplumber.open(io.BytesIO(uploaded_file.getvalue())) as pdf:
         for page in pdf.pages:
-            # We extract words with their coordinates to manually build the columns
-            # This prevents the 'shifting' seen in your previous screenshots
+            # We extract every word with its exact X/Y position
             words = page.extract_words()
             
-            # Group words by their vertical (top) position to form lines
+            # Group words into lines based on their vertical 'top' position
             lines = {}
             for w in words:
                 y = round(w['top'], 0)
@@ -38,52 +36,50 @@ if uploaded_file:
                 lines[y].append(w)
             
             for y in sorted(lines.keys()):
+                # Sort words in each line from left to right
                 line_words = sorted(lines[y], key=lambda x: x['x0'])
-                full_line_text = " ".join([w['text'] for w in line_words])
+                line_text = " ".join([w['text'] for w in line_words])
                 
-                # Check for Date Pattern (e.g., 01 JUL)
-                date_match = re.search(r'^(\d{1,2}\s+[A-Z]{3})', full_line_text)
+                # Check for the ANZ Date Pattern (e.g., 01 JUL)
+                date_match = re.search(r'^(\d{1,2}\s+[A-Z]{3})', line_text)
                 
                 if date_match:
                     date_val = date_match.group(1)
                     
-                    # ANZ Spatial Mapping based on Page Width %
-                    # Description: usually between 15% and 55%
-                    # Withdrawals: usually between 55% and 70%
-                    # Deposits: usually between 70% and 85%
-                    # Balance: usually between 85% and 100%
+                    # --- ANZ SPATIAL BOUNDARIES (Manual Gates) ---
+                    # Description: Text between x=65 and x=350
+                    # Withdrawals: Text between x=350 and x=435
+                    # Deposits:    Text between x=435 and x=515
+                    # Balance:     Text between x=515 and end
                     
-                    desc_parts = [w['text'] for w in line_words if 60 < w['x0'] < 330]
-                    withdraw_parts = [w['text'] for w in line_words if 330 <= w['x0'] < 420]
-                    deposit_parts = [w['text'] for w in line_words if 420 <= w['x0'] < 510]
-                    balance_parts = [w['text'] for w in line_words if 510 <= w['x0']]
+                    desc = " ".join([w['text'] for w in line_words if 65 <= w['x0'] < 350])
+                    withdraw = " ".join([w['text'] for w in line_words if 350 <= w['x0'] < 435])
+                    deposit = " ".join([w['text'] for w in line_words if 435 <= w['x0'] < 515])
+                    balance = " ".join([w['text'] for w in line_words if 515 <= w['x0']])
                     
-                    # Avoid capturing the year '2022' or 'OPENING BALANCE'
-                    desc_text = " ".join(desc_parts)
-                    if "OPENING BALANCE" in desc_text: continue
+                    if "OPENING BALANCE" in desc.upper(): continue
                     
-                    all_transactions.append({
+                    all_rows.append({
                         "Date": date_val,
-                        "Description": desc_text,
-                        "Withdrawals": clean_numeric(" ".join(withdraw_parts)),
-                        "Deposits": clean_numeric(" ".join(deposit_parts)),
-                        "Balance": clean_numeric(" ".join(balance_parts))
+                        "Description": desc.strip(),
+                        "Withdrawals": clean_money(withdraw),
+                        "Deposits": clean_money(deposit),
+                        "Balance": clean_money(balance)
                     })
                 
-                elif all_transactions and len(full_line_text) > 5:
-                    # Stitching multi-line descriptions
-                    # Captures details like 'TO JAMEER USMAN'
-                    extra_desc = " ".join([w['text'] for w in line_words if 60 < w['x0'] < 330])
+                elif all_rows and len(line_text) > 5:
+                    # Capture multi-line description continuation
+                    # (Text in the same horizontal 'Description' gate but no new date)
+                    extra_desc = " ".join([w['text'] for w in line_words if 65 <= w['x0'] < 350])
                     if extra_desc and not any(k in extra_desc for k in ["Page", "Total", "Balance"]):
-                        all_transactions[-1]["Description"] += " " + extra_desc
+                        all_rows[-1]["Description"] += " " + extra_desc.strip()
 
-    if all_transactions:
-        df = pd.DataFrame(all_transactions)
+    if all_rows:
+        df = pd.DataFrame(all_rows)
+        st.success(f"Processed {len(df)} transactions.")
+        st.dataframe(df) # Preview in browser
         
-        # Post-processing: Ensure Debit/Credit aren't swapped
-        # Real spend shows in 'Withdrawals', income in 'Deposits'
-        st.dataframe(df, use_container_width=True)
-        
+        # Excel Export
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df.to_excel(writer, index=False)
@@ -91,8 +87,8 @@ if uploaded_file:
         st.download_button(
             label="📥 Download Corrected Excel",
             data=output.getvalue(),
-            file_name="ANZ_Statement_Fixed.xlsx",
+            file_name="ANZ_Fixed_Statement.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
     else:
-        st.error("No transactions found. Check if PDF is text-selectable.")
+        st.error("No transactions found. Make sure the PDF is text-selectable.")
